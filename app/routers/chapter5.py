@@ -251,49 +251,108 @@ async def get_delivery_assistance(
 @router.get("/postnatal-care", response_model=IndicatorResponse)
 async def get_postnatal_care(
     region: RegionCode = Query(default=RegionCode.EASTERN),
-    timing: str = Query(default="within_2_days", description="Options: within_2_days, any"),
+    target: str = Query(default="women", description="Options: women, newborn"),
     data_loader: DHSDataLoader = Depends(get_data_loader),
     calc: CalculationService = Depends(get_calculation_service)
 ):
     """
-    Get postnatal care coverage for mothers.
-    
-    m50_1: Timing of first postnatal checkup
-    - 0: No checkup
-    - 100-199: Within first hour
-    - 200-299: Hours 1-24
-    - 300-399: Days 1-7
+    Get postnatal care checkup within first 2 days for women or newborns.
+    Uses children dataset (RWKR81FL), filtered for most recent birth (midx=1)
+    in the last 2 years (b19 < 24 months).
+
+    **Women PNC logic:**
+    - Checked after delivery (m62=1) with timing m63 in valid range, OR
+    - Checked before discharge (m66=1) with timing m67 in valid range.
+
+    **Newborn PNC logic:**
+    - Checked after delivery (m70=1) with timing m71 in valid range, OR
+    - Checked before discharge (m74=1) with timing m75 in valid range.
+
+    **Valid timing codes:** 100–171 (hours) or 198–202 (days within 2 days).
     """
     try:
-        df = data_loader.load_dataset("women")
-        df = filter_recent_births(df, 60)
-        
-        m50 = 'm50_1' if 'm50_1' in df.columns else 'm50_01'
-        df[m50] = pd.to_numeric(df[m50], errors='coerce').fillna(0)
-        
-        if timing == "within_2_days":
-            # Within first 2 days (48 hours): codes 100-299
-            df['indicator'] = ((df[m50] >= 100) & (df[m50] < 300)).astype(int)
-            label = "Postnatal Check Within 2 Days"
-        else:  # any
-            df['indicator'] = (df[m50] > 0).astype(int)
-            label = "Received Any Postnatal Care"
-        
+        # Load children dataset (RWKR81FL)
+        df = data_loader.load_dataset("children")
+
+        # Ensure numeric types for filter columns
+        for col in ['midx', 'b19', 'v024', 'v005']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Filter: most recent birth (midx == 1) AND born in last 2 years (b19 < 24)
+        df = df[
+            (df['midx'] == 1) &
+            (df['b19'] < 24)
+        ].copy()
+
+        if len(df) == 0:
+            raise HTTPException(status_code=404, detail="No births found in the last 2 years")
+
+        # Helper: check if timing code is within first 2 days
+        def _valid_timing(t):
+            """Return True if timing code represents within 2 days."""
+            if pd.isna(t):
+                return False
+            t = int(t)
+            return (100 <= t <= 171) or t in (198, 199, 200, 201, 202)
+
+        # --- PNC for Women ---
+        def check_women(row):
+            # Check m62 (checked after delivery)
+            if row.get('m62') == 1 and _valid_timing(row.get('m63')):
+                return 1
+            # Check m66 (checked before discharge)
+            if row.get('m66') == 1 and _valid_timing(row.get('m67')):
+                return 1
+            return 0
+
+        # --- PNC for Newborn ---
+        def check_newborn(row):
+            # Check m70 (baby checked after delivery)
+            if row.get('m70') == 1 and _valid_timing(row.get('m71')):
+                return 1
+            # Check m74 (baby checked before discharge)
+            if row.get('m74') == 1 and _valid_timing(row.get('m75')):
+                return 1
+            return 0
+
+        # Ensure PNC columns are numeric
+        pnc_cols = ['m62', 'm63', 'm66', 'm67', 'm70', 'm71', 'm74', 'm75']
+        for col in pnc_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Apply the chosen PNC logic
+        if target == "women":
+            df['indicator'] = df.apply(check_women, axis=1)
+            label = "Postnatal Checkup Within 2 Days (Women)"
+        elif target == "newborn":
+            df['indicator'] = df.apply(check_newborn, axis=1)
+            label = "Postnatal Checkup Within 2 Days (Newborn)"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid target. Choose: women, newborn"
+            )
+
+        # Filter by region
         region_df = df[df['v024'] == region.value].copy()
-        
+
+        # Dynamically detect district column and use config-based district maps
         province_key = get_province_key(region.value)
         district_map = DISTRICT_MAPS.get(province_key, {})
         dist_col = calc.get_district_column(region_df)
-        
+
+        # Calculate per-district values
         districts_data = {}
         for dist_code, dist_name in district_map.items():
             dist_df = region_df[pd.to_numeric(region_df[dist_col], errors='coerce') == dist_code]
             if not dist_df.empty:
                 districts_data[dist_name] = calc.weighted_percentage(dist_df, 'indicator', weight_col='v005')
-        
+
         province_val = calc.weighted_percentage(region_df, 'indicator', weight_col='v005')
         national_val = calc.weighted_percentage(df, 'indicator', weight_col='v005')
-        
+
         return format_indicator_response(
             indicator_name=label,
             unit="Percentage",
@@ -301,9 +360,9 @@ async def get_postnatal_care(
             province_value=province_val,
             province_code=region.value,
             national_value=national_val,
-            population_type="Women with a live birth in the last 5 years"
+            population_type="Births in the last 2 years (most recent birth)"
         )
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
